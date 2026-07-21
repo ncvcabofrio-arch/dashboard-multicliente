@@ -1,11 +1,12 @@
 """
-Robo: importa os ANUNCIOS ATIVOS das contas conectadas -> tabela produtos.
+Robo: importa os ANUNCIOS ATIVOS das contas conectadas -> tabela anuncios.
 
-- Le a fila sync_jobs: pega os jobs tipo='produtos' pendentes e processa.
-  (Se rodar sem job pendente, com FORCAR_TODAS=1, processa todas as contas.)
-- Para cada conta: varre os anuncios ativos (modo scan), pega detalhes,
-  monta 1 linha por SKU (inclui variacoes) e faz UPSERT em produtos.
-- NAO toca em custo/fornecedor (sao preenchidos na mao no painel).
+- NAO cria produto. Produto e criado na mao pelo painel (a partir de um anuncio).
+- Le a fila sync_jobs: pega jobs tipo='produtos' pendentes (o botao "Importar
+  anuncios" do painel). Com FORCAR_TODAS=1 processa todas as contas.
+- Para cada conta: varre anuncios ativos (scan), pega detalhes/variacoes e faz
+  UPSERT em anuncios (1 linha por MLB/variacao). NAO mexe em produto_id (o vinculo
+  feito na mao fica preservado).
 
 Secrets (GitHub Actions): SUPABASE_URL, SUPABASE_KEY (service_role),
                           ML_CLIENT_ID, ML_CLIENT_SECRET
@@ -89,39 +90,37 @@ def _sku_variacao(v):
     return str(sku).strip() if sku else None
 
 
-def linhas_produto(org_id, b):
-    """1 linha por SKU. Se tiver variacoes, uma por variacao."""
+def linhas_anuncio(org_id, b):
+    """1 linha por anuncio/variacao. produto_id NAO vai aqui (fica preservado)."""
     linhas = []
     variacoes = b.get("variations") or []
     if variacoes:
         for v in variacoes:
-            sku = _sku_variacao(v)
-            if not sku:
-                continue
             linhas.append({
-                "org_id": org_id, "sku": sku, "mlb": b.get("id"),
-                "nome": b.get("title"),
+                "org_id": org_id, "mlb": b.get("id"),
+                "variacao_id": str(v.get("id") or ""),
+                "sku": _sku_variacao(v),
+                "titulo": b.get("title"),
                 "preco": v.get("price") if v.get("price") is not None else b.get("price"),
                 "estoque": v.get("available_quantity"),
-                "status": b.get("status"), "atualizado_em": _agora(),
+                "status_ml": b.get("status"), "atualizado_em": _agora(),
             })
     else:
-        sku = _sku_item(b)
-        if sku:
-            linhas.append({
-                "org_id": org_id, "sku": sku, "mlb": b.get("id"),
-                "nome": b.get("title"), "preco": b.get("price"),
-                "estoque": b.get("available_quantity"),
-                "status": b.get("status"), "atualizado_em": _agora(),
-            })
+        linhas.append({
+            "org_id": org_id, "mlb": b.get("id"), "variacao_id": "",
+            "sku": _sku_item(b), "titulo": b.get("title"),
+            "preco": b.get("price"), "estoque": b.get("available_quantity"),
+            "status_ml": b.get("status"), "atualizado_em": _agora(),
+        })
     return linhas
 
 
-def upsert_produtos(linhas):
-    # on_conflict org_id,sku -> atualiza SO as colunas enviadas
-    # (custo/fornecedor nao vao no payload, entao ficam preservados)
+def upsert_anuncios(linhas):
+    # on_conflict (org_id, mlb, variacao_id): atualiza SO as colunas enviadas.
+    # produto_id nao vai no payload -> vinculo feito na mao fica preservado.
     for i in range(0, len(linhas), 200):
-        sb.table("produtos").upsert(linhas[i:i + 200], on_conflict="org_id,sku").execute()
+        sb.table("anuncios").upsert(linhas[i:i + 200],
+                                    on_conflict="org_id,mlb,variacao_id").execute()
 
 
 def processar_conta(conta):
@@ -131,10 +130,15 @@ def processar_conta(conta):
     dets = detalhes(tok, ids)
     linhas = []
     for b in dets:
-        linhas += linhas_produto(conta["org_id"], b)
+        linhas += linhas_anuncio(conta["org_id"], b)
+    # dedup defensivo por (mlb, variacao_id)
+    dedup = {}
+    for l in linhas:
+        dedup[(l["org_id"], l["mlb"], l["variacao_id"])] = l
+    linhas = list(dedup.values())
     if linhas:
-        upsert_produtos(linhas)
-    print(f"  -> {len(linhas)} SKUs importados")
+        upsert_anuncios(linhas)
+    print(f"  -> {len(linhas)} anuncios importados")
     return len(linhas)
 
 
@@ -149,11 +153,9 @@ def contas_ativas():
 
 
 def main():
-    # 1) jobs pendentes de produtos
     jobs = (sb.table("sync_jobs").select("*")
             .eq("tipo", "produtos").eq("status", "pendente")
             .order("criado_em").execute().data or [])
-
     if jobs:
         for job in jobs:
             sb.table("sync_jobs").update({"status": "rodando", "progresso": "importando anuncios",
@@ -163,7 +165,7 @@ def main():
                 if not conta:
                     raise RuntimeError("conta do job nao encontrada")
                 n = processar_conta(conta)
-                sb.table("sync_jobs").update({"status": "ok", "progresso": f"{n} SKUs",
+                sb.table("sync_jobs").update({"status": "ok", "progresso": f"{n} anuncios",
                                               "atualizado_em": _agora()}).eq("id", job["id"]).execute()
             except Exception as e:
                 print("ERRO no job", job["id"], ":", e)
@@ -171,7 +173,6 @@ def main():
                                               "atualizado_em": _agora()}).eq("id", job["id"]).execute()
         return
 
-    # 2) sem job: so processa tudo se forçado (agendamento diario)
     if FORCAR_TODAS:
         total = 0
         for c in contas_ativas():
@@ -179,7 +180,7 @@ def main():
                 total += processar_conta(c)
             except Exception as e:
                 print("ERRO conta", c["id"], ":", e)
-        print(f"Total: {total} SKUs")
+        print(f"Total: {total} anuncios")
     else:
         print("Nada a fazer (sem job pendente). Use FORCAR_TODAS=1 pra varrer todas.")
 
