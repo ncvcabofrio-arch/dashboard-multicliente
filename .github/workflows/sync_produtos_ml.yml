@@ -1,0 +1,37 @@
+name: Sync Produtos ML (anuncios ativos)
+# Processa a fila (jobs de "importar anuncios" disparados no painel) a cada 10 min,
+# e faz uma varredura completa 1x/dia. Tambem roda na mao (Run workflow).
+on:
+  schedule:
+    - cron: "*/10 * * * *"     # processa jobs pendentes
+    - cron: "0 6 * * *"        # varredura completa diaria (06:00 UTC)
+  workflow_dispatch:
+    inputs:
+      forcar_todas:
+        description: "Varrer TODAS as contas agora? (1 = sim)"
+        type: string
+        default: "0"
+
+concurrency:
+  group: sync-produtos-ml
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Instalar dependencias
+        run: pip install requests supabase
+      - name: Rodar sync de produtos
+        env:
+          SUPABASE_URL:     ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:     ${{ secrets.SUPABASE_KEY }}     # service_role
+          ML_CLIENT_ID:     ${{ secrets.ML_CLIENT_ID }}
+          ML_CLIENT_SECRET: ${{ secrets.ML_CLIENT_SECRET }}
+          # varredura completa: no cron das 06h OU quando pedir na mao com 1
+          FORCAR_TODAS: ${{ (github.event.schedule == '0 6 * * *' || github.event.inputs.forcar_todas == '1') && '1' || '0' }}
+        run: python sync_produtos_ml.py
