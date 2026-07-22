@@ -24,29 +24,38 @@ def _agora():
     return datetime.now(timezone.utc).isoformat()
 
 
-def ids_ativos(token, seller_id):
-    """Todos os ids de anuncios ativos (modo scan aguenta qualquer volume)."""
-    ids, scroll = [], None
-    while True:
-        params = {"search_type": "scan", "limit": 100, "status": "active"}
-        if scroll:
-            params["scroll_id"] = scroll
-        r = requests.get(
-            f"https://api.mercadolibre.com/users/{seller_id}/items/search",
-            params=params, headers={"Authorization": "Bearer " + token}, timeout=60)
-        if r.status_code != 200:
-            print(f"  aviso: items/search status {r.status_code} {r.text[:150]}")
-            break
-        d = r.json()
-        res = d.get("results", []) or []
-        if not res:
-            break
-        ids += res
-        scroll = d.get("scroll_id")
-        if not scroll:
-            break
-        time.sleep(0.3)
-    return ids
+def ids_anuncios(token, seller_id, status_list=("active", "paused")):
+    """Ids dos anuncios ATIVOS e PAUSADOS (modo scan aguenta qualquer volume).
+
+    Pausado tambem faz parte do catalogo (tem SKU/estoque e pode voltar), por isso
+    entra aqui. Os ENCERRADOS ficam de fora de proposito - esses so vem quando
+    venderam, pela acao "Buscar anuncios que venderam" (aba Vendas).
+    """
+    ids = []
+    for st in status_list:
+        scroll, achou = None, 0
+        while True:
+            params = {"search_type": "scan", "limit": 100, "status": st}
+            if scroll:
+                params["scroll_id"] = scroll
+            r = requests.get(
+                f"https://api.mercadolibre.com/users/{seller_id}/items/search",
+                params=params, headers={"Authorization": "Bearer " + token}, timeout=60)
+            if r.status_code != 200:
+                print(f"  aviso: items/search ({st}) status {r.status_code} {r.text[:150]}")
+                break
+            d = r.json()
+            res = d.get("results", []) or []
+            if not res:
+                break
+            ids += res
+            achou += len(res)
+            scroll = d.get("scroll_id")
+            if not scroll:
+                break
+            time.sleep(0.3)
+        print(f"  {st}: {achou} anuncio(s)")
+    return list(dict.fromkeys(ids))     # tira repetidos, mantem a ordem
 
 
 def detalhes(token, ids):
@@ -125,8 +134,9 @@ def upsert_anuncios(linhas):
 
 def processar_conta(conta):
     tok = get_token(conta["id"])
-    ids = ids_ativos(tok, conta["seller_id"])
-    print(f"{conta.get('nickname') or conta['seller_id']}: {len(ids)} anuncios ativos")
+    print(f"{conta.get('nickname') or conta['seller_id']}:")
+    ids = ids_anuncios(tok, conta["seller_id"])
+    print(f"  total: {len(ids)} anuncio(s) (ativos + pausados)")
     dets = detalhes(tok, ids)
     linhas = []
     for b in dets:
