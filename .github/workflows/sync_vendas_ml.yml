@@ -1,0 +1,37 @@
+name: Sync Vendas ML (pedidos)
+# Processa a fila (botao "Baixar vendas" do painel) a cada 15 min e faz uma
+# atualizacao incremental (ultimo mes) de hora em hora. Tambem roda na mao.
+on:
+  schedule:
+    - cron: "*/15 * * * *"    # pega jobs pendentes de vendas
+    - cron: "20 * * * *"      # incremental do ultimo mes, toda hora
+  workflow_dispatch:
+    inputs:
+      forcar_todas:
+        description: "Atualizar o ultimo mes de TODAS as contas agora? (1 = sim)"
+        type: string
+        default: "0"
+
+concurrency:
+  group: sync-vendas-ml
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Instalar dependencias
+        run: pip install requests supabase
+      - name: Rodar sync de vendas
+        env:
+          SUPABASE_URL:     ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:     ${{ secrets.SUPABASE_KEY }}     # service_role
+          ML_CLIENT_ID:     ${{ secrets.ML_CLIENT_ID }}
+          ML_CLIENT_SECRET: ${{ secrets.ML_CLIENT_SECRET }}
+          FORCAR_TODAS: ${{ (github.event.schedule == '20 * * * *' || github.event.inputs.forcar_todas == '1') && '1' || '0' }}
+        run: python sync_vendas_ml.py
