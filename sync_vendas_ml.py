@@ -135,6 +135,79 @@ def upsert_vendas(linhas):
         sb.table("vendas").upsert(linhas[i:i + 200], on_conflict="org_id,order_id,seq").execute()
 
 
+# ---------------------------------------------------------------------
+# Completar anuncios que VENDERAM mas nao estao na base (encerrados/pausados).
+# O robo de produtos importa so os ATIVOS; sem isso, vendas antigas ficam
+# sem vinculo com produto.
+# ---------------------------------------------------------------------
+def _sku_item(b):
+    scf = b.get("seller_custom_field")
+    if scf:
+        return str(scf).strip()
+    for a in (b.get("attributes") or []):
+        if a.get("id") == "SELLER_SKU" and a.get("value_name"):
+            return str(a["value_name"]).strip()
+    return None
+
+
+def _sku_variacao(v):
+    sku = v.get("seller_sku") or v.get("seller_custom_field")
+    if not sku:
+        for a in (v.get("attributes") or []):
+            if a.get("id") == "SELLER_SKU" and a.get("value_name"):
+                sku = a["value_name"]
+                break
+    return str(sku).strip() if sku else None
+
+
+def _linhas_anuncio(org_id, b):
+    linhas, variacoes = [], (b.get("variations") or [])
+    if variacoes:
+        for v in variacoes:
+            linhas.append({"org_id": org_id, "mlb": b.get("id"), "variacao_id": str(v.get("id") or ""),
+                           "sku": _sku_variacao(v), "titulo": b.get("title"),
+                           "preco": v.get("price") if v.get("price") is not None else b.get("price"),
+                           "estoque": v.get("available_quantity"), "status_ml": b.get("status"),
+                           "atualizado_em": _agora()})
+    else:
+        linhas.append({"org_id": org_id, "mlb": b.get("id"), "variacao_id": "",
+                       "sku": _sku_item(b), "titulo": b.get("title"), "preco": b.get("price"),
+                       "estoque": b.get("available_quantity"), "status_ml": b.get("status"),
+                       "atualizado_em": _agora()})
+    return linhas
+
+
+def completar_anuncios_das_vendas(conta, token):
+    org = conta["org_id"]
+    vend = sb.table("vendas").select("mlb").eq("org_id", org).execute().data or []
+    anun = sb.table("anuncios").select("mlb").eq("org_id", org).execute().data or []
+    faltam = sorted({r["mlb"] for r in vend if r.get("mlb")} - {r["mlb"] for r in anun if r.get("mlb")})
+    if not faltam:
+        return 0
+    print(f"  completando {len(faltam)} anuncio(s) que venderam mas nao estavam na base...")
+    campos = "id,title,price,available_quantity,status,seller_custom_field,attributes,variations"
+    linhas = []
+    for i in range(0, len(faltam), 20):
+        r = requests.get("https://api.mercadolibre.com/items",
+                         params={"ids": ",".join(faltam[i:i + 20]), "attributes": campos},
+                         headers={"Authorization": "Bearer " + token}, timeout=60)
+        if r.status_code != 200:
+            time.sleep(1)
+            continue
+        for w in (r.json() or []):
+            b = w.get("body") or {}
+            if b.get("id"):
+                linhas += _linhas_anuncio(org, b)
+        time.sleep(0.3)
+    dedup = {}
+    for l in linhas:
+        dedup[(l["org_id"], l["mlb"], l["variacao_id"])] = l
+    linhas = list(dedup.values())
+    for i in range(0, len(linhas), 200):
+        sb.table("anuncios").upsert(linhas[i:i + 200], on_conflict="org_id,mlb,variacao_id").execute()
+    return len(linhas)
+
+
 def prog(job_id, txt):
     if not job_id:
         return
@@ -191,23 +264,33 @@ def contas_ativas():
 
 
 def main():
+    # tipos que este robo atende:
+    #   vendas            -> baixar pedidos (params.meses)
+    #   anuncios_vendidos -> buscar no ML os anuncios que venderam e nao estao na base
     jobs = (sb.table("sync_jobs").select("*")
-            .eq("tipo", "vendas").eq("status", "pendente")
+            .in_("tipo", ["vendas", "anuncios_vendidos"]).eq("status", "pendente")
             .order("criado_em").execute().data or [])
 
     if jobs:
         for job in jobs:
-            meses = int((job.get("params") or {}).get("meses") or MESES_PADRAO)
             sb.table("sync_jobs").update({"status": "rodando", "progresso": "iniciando",
                                           "atualizado_em": _agora()}).eq("id", job["id"]).execute()
             try:
                 conta = conta_por_id(job["conta_id"])
                 if not conta:
                     raise RuntimeError("conta do job nao encontrada")
-                n = processar_conta(conta, meses, job["id"])
-                pos_processar()
-                sb.table("sync_jobs").update({"status": "ok", "progresso": f"{n} itens de venda",
-                                              "atualizado_em": _agora()}).eq("id", job["id"]).execute()
+
+                if job.get("tipo") == "anuncios_vendidos":
+                    n = completar_anuncios_das_vendas(conta, get_token(conta["id"]))
+                    sb.table("sync_jobs").update({"status": "ok",
+                                                  "progresso": f"{n} anúncio(s) trazidos",
+                                                  "atualizado_em": _agora()}).eq("id", job["id"]).execute()
+                else:
+                    meses = int((job.get("params") or {}).get("meses") or MESES_PADRAO)
+                    n = processar_conta(conta, meses, job["id"])
+                    pos_processar()
+                    sb.table("sync_jobs").update({"status": "ok", "progresso": f"{n} itens de venda",
+                                                  "atualizado_em": _agora()}).eq("id", job["id"]).execute()
             except Exception as e:
                 print("ERRO no job", job["id"], ":", e)
                 sb.table("sync_jobs").update({"status": "erro", "erro": str(e)[:400],
