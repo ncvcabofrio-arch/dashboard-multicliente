@@ -18,6 +18,7 @@ from ml_auth_multi import sb, get_token
 
 MESES_PADRAO = int(os.environ.get("MESES_PADRAO", "12"))
 FORCAR_TODAS = os.environ.get("FORCAR_TODAS", "0") == "1"
+PULAR_REBATE = os.environ.get("PULAR_REBATE", "0") == "1"   # 1 = nao busca rebate (mais rapido)
 
 
 def _agora():
@@ -112,6 +113,27 @@ def uf_cidade_pedido(token, o, cache):
     return None, None
 
 
+def rebate_pedido(token, oid):
+    """Rebate = quanto o ML/parceiro subsidiou no pedido (endpoint /orders/{id}/discounts).
+    Soma, nos descontos com 'supplier', o (total - seller) de cada item."""
+    try:
+        r = requests.get("https://api.mercadolibre.com/orders/" + str(oid) + "/discounts",
+                         headers={"Authorization": "Bearer " + token}, timeout=30)
+        time.sleep(0.2)
+        if r.status_code != 200:
+            return 0.0
+        d = r.json()
+        reb = 0.0
+        for det in (d.get("details") or []):
+            if det.get("supplier"):
+                for itx in (det.get("items") or []):
+                    amts = itx.get("amounts") or {}
+                    reb += max((amts.get("total") or 0) - (amts.get("seller") or 0), 0)
+        return round(reb, 2)
+    except Exception:
+        return 0.0
+
+
 def _frete_total(o):
     tot = 0.0
     for p in (o.get("payments") or []):
@@ -167,6 +189,11 @@ def linhas_do_pedido(org_id, conta_id, o, token=None, ship_cache=None):
             "frete": round(frete * (valores[seq] / soma), 2),
             "uf": uf, "cidade": cidade,
         })
+    # rebate e por PEDIDO: grava no 1o item pra somar certo; 0 nos demais
+    for l in linhas:
+        l["rebate"] = 0
+    if token is not None and linhas and not PULAR_REBATE:
+        linhas[0]["rebate"] = rebate_pedido(token, o.get("id"))
     return linhas
 
 
