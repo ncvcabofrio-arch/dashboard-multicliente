@@ -66,13 +66,50 @@ def buscar_pedidos(token, seller_id, ini, fim):
 
 
 def _uf_cidade(o):
+    # as vezes o proprio pedido ja traz o endereco
     try:
         addr = ((o.get("shipping") or {}).get("receiver_address") or {})
         uf = ((addr.get("state") or {}).get("name")) or ((addr.get("state") or {}).get("id"))
         cid = ((addr.get("city") or {}).get("name"))
-        return uf, cid
+        if uf:
+            return uf, cid
     except Exception:
+        pass
+    return None, None
+
+
+def uf_cidade_pedido(token, o, cache):
+    """UF/cidade do comprador. Se o pedido nao traz, busca no ENVIO (shipment).
+    cache: {shipment_id: (uf, cidade)} pra nao repetir chamada.
+    """
+    uf, cid = _uf_cidade(o)
+    if uf:
+        return uf, cid
+    sid = (o.get("shipping") or {}).get("id")
+    if not sid:
         return None, None
+    if sid in cache:
+        return cache[sid]
+    try:
+        r = requests.get("https://api.mercadolibre.com/shipments/" + str(sid),
+                         headers={"Authorization": "Bearer " + token}, timeout=30)
+        time.sleep(0.25)
+        if r.status_code == 200:
+            addr = (r.json().get("receiver_address") or {})
+            uf = ((addr.get("state") or {}).get("name")) or ((addr.get("state") or {}).get("id"))
+            cid = ((addr.get("city") or {}).get("name"))
+            cache[sid] = (uf, cid)
+            return uf, cid
+        if r.status_code in (401, 403):
+            # app sem permissao de Envios -> avisa 1x e desiste de buscar UF
+            if not cache.get("_avisou"):
+                print("  aviso: sem permissao pra ler Envios (UF ficara vazio). "
+                      "Ative a permissao de Envios no app do ML.")
+                cache["_avisou"] = True
+    except Exception:
+        pass
+    cache[sid] = (None, None)
+    return None, None
 
 
 def _frete_total(o):
@@ -90,11 +127,14 @@ def _frete_total(o):
     return tot
 
 
-def linhas_do_pedido(org_id, conta_id, o):
+def linhas_do_pedido(org_id, conta_id, o, token=None, ship_cache=None):
     itens = o.get("order_items") or []
     if not itens:
         return []
-    uf, cidade = _uf_cidade(o)
+    if token is not None and ship_cache is not None:
+        uf, cidade = uf_cidade_pedido(token, o, ship_cache)
+    else:
+        uf, cidade = _uf_cidade(o)
     frete = _frete_total(o)
     # valor de cada linha, pra ratear o frete proporcionalmente
     valores = []
@@ -219,11 +259,12 @@ def processar_conta(conta, meses, job_id=None):
     nome = conta.get("nickname") or conta["seller_id"]
     jans = janelas(meses)
     total_linhas, total_ped = 0, 0
+    ship_cache = {}   # {shipment_id: (uf, cidade)} reaproveitado entre janelas
     for idx, (ini, fim) in enumerate(jans, start=1):
         pedidos = buscar_pedidos(tok, conta["seller_id"], ini, fim)
         linhas = []
         for o in pedidos:
-            linhas += linhas_do_pedido(conta["org_id"], conta["id"], o)
+            linhas += linhas_do_pedido(conta["org_id"], conta["id"], o, tok, ship_cache)
         # dedup defensivo por (order_id, seq)
         dedup = {}
         for l in linhas:
